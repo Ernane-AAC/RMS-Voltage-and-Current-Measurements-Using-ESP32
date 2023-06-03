@@ -1,0 +1,43 @@
+
+h1 {
+  color: darkblue;
+  text-align: center;
+}
+
+h3 {
+  color: darkblue;
+}
+
+figure {
+  margin: auto;
+}
+
+.content1{
+   width: 200px
+   margin:auto
+   padding: 25px 50px;
+   border:  solid blue
+}
+
+.content2{
+   margin:auto
+   padding: 25px 50px;
+   background-color: #A9F5F2;
+}
+
+.content3{
+   margin:auto
+   padding: 25px 50px;
+   background-color: #CEF6F5;
+}
+
+.content4{
+   margin:auto
+   padding: 25px 50px;
+   background-color: #A9F5F2;
+}
+.content5{
+   margin:auto
+   padding: 25px 50px;
+   background-color: #CEF6F5;
+}
