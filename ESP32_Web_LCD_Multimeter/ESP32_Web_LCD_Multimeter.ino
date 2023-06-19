@@ -13,6 +13,9 @@
 //       for visualization on a LCD and web page. You can change the frequency according to the application, but keep 
 //       in mind that ESP32 runs over FreeRTOS considering a default tick of 100 Hz, then it is not possible
 //       to transfer data between tasks in higher rates. 
+// Additional Libraries used in this code:
+//  -> LiquidCrystal_I2C: https://github.com/fdebrabander/Arduino-LiquidCrystal-I2C-library/archive/refs/heads/master.zip
+//  -> ESP32WebServer: https://github.com/Pedroalbuquerque/ESP32WebServer
 
 #include <math.h>
 #include <stdio.h>
@@ -187,11 +190,12 @@ void setup() {
      }
   buf_index=0;
  //-> coefficients to convert samples to Volt and Ampére obtained by multipoint calibration 
-   gain_v = 0.5375;
- offset_v = -1010.6;
-   gain_i = -0.0065602;
- offset_i = 12.303; 
-
+ //-> Dados de calibração Jun/2023 - LV20_Rp=27k  LA55-> 4 espiras
+   gain_v = 0.279;
+ offset_v = -523.69;
+   gain_i = -0.0065728;
+ offset_i = 12.338;
+ 
  // Create queues to transfer data 
  queue_samples = xQueueCreate( 1, sizeof(struct summation_samples )); // create queue -> 1 position of struct summation_samples
  queue_RMS_Value = xQueueCreate( 1, sizeof(struct RMS_quantities )); // create queue -> 1 position of struct summation_samples
