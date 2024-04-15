@@ -147,6 +147,9 @@ void setup() {
   adcAttachPin(ADC1_CHANNEL_4);
   adcAttachPin(ADC1_CHANNEL_5);
   analogSetClockDiv(1);
+  adc1_config_width(ADC_WIDTH_BIT_12);
+  adc1_config_channel_atten(ADC1_CHANNEL_4,ADC_ATTEN_DB_11);
+  adc1_config_channel_atten(ADC1_CHANNEL_5,ADC_ATTEN_DB_11);
 
  lcd1.begin();     //start LCD1
  lcd2.begin();     //start LCD2
