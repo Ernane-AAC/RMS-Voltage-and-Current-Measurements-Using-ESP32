@@ -2,20 +2,19 @@
 // Subject: DSP-EPS - Prof. Ernane A. A. Coelho - http://lattes.cnpq.br/9183492978798433
 // Code for RMS Voltage and Current Measurements 
 //  * run on Esp32 Lab System (ESP32-WROOM-32 module)
-//  * Sample rate ~=6kHz (6000.6 Hz)  ==> 100 samples per period (fundamental frequency at 60Hz)
+//  * Sample rate ~=6kHz (6000.15 Hz)  ==> 100 samples per period (fundamental frequency at 60Hz)
 //  * RMS calculation considering a moving average filter:
 //    - summations of digital samples(Vk, Vk^2, Ik e Ik^2) are performed in integer arithmetic
 //         inside the ISR (~=6kHz), since ESP32 does not support floating point operation inside the ISR
-//    - every 1/2 second the ISR sends the summations for a specific task, which calculate the rms values
-//    - the task converts sample summations to Volt and Ampére and calculates the RMS values in floating point
+//    - every 1 second the ISR sends the summations for a specific task, which calculate the rms values
+//    - the task converts sample summations to Volt and Ampére and calculates the RMS values in floating point inside the loop task
 //    - the RMS values are presented in a 20x4 LCD connected in i2c bus and are also available using a Webserver
-// NOTE: In this proposal, the RMS values are made available at low frequency (2Hz), since they are intended 
+// NOTE: In this proposal, the RMS values are made available at low frequency (1Hz), since they are intended 
 //       for visualization on a LCD and web page. You can change the frequency according to the application, but keep 
-//       in mind that ESP32 runs over FreeRTOS considering a default tick of 100 Hz, then it is not possible
-//       to transfer data between tasks in higher rates. 
+//       in mind that that the task that consumes the generated data must accompany the one that produces it.
 // Additional Libraries used in this code:
 //  -> LiquidCrystal_I2C: https://github.com/fdebrabander/Arduino-LiquidCrystal-I2C-library/archive/refs/heads/master.zip
-//  -> ESP32WebServer: https://github.com/Pedroalbuquerque/ESP32WebServer
+//  -> ESP32WebServer:    https://github.com/Pedroalbuquerque/ESP32WebServer
 
 #include <math.h>
 #include <stdio.h>
@@ -28,15 +27,21 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
+#include "esp_intr_alloc.h"
 #include "driver/timer.h"
 #include "driver/adc.h" //==> to use adc1_get_raw(channel)
-//==> adc1_get_raw(channel)[~=36us] is faster than analogRead(channel)[~=52us]
-//Definitions below are intrinsic of the adc library
-//# define ADC1_CHANNEL_4 32  //GPIO32  -> Voltage channel
-//# define ADC1_CHANNEL_5 33  //GPIO33  -> Current channel
+                        //==> adc1_get_raw(channel)[~=36us] is faster than analogRead(channel)[~=52us]
 # define Run_LED_Control 2  //connected to GPIO2
+#define TIMER_GROUP           TIMER_GROUP_0  
+#define TIMER_INDEX           TIMER_0        
+#define TIMER_DIVIDER         67   // The divider’s range is from 2 to 65536. This code 67 ==> Timer_CLK = 80 MHz/67=1.19402985 MHz          
+#define TIMER_TOP_COUNT       198  // 1.19402985 MHz/(TOP+1)= 1.19402985 MHz/199 => 6000.15 Hz
+//There are different pairs of divider and Counter_Steps that can generate a carrier with a frequency close to 6 kHz. 
+//Since divider and Counter_Steps are integers, it is not possible to generate a carrier with an exact frequency of 6 kHz. 
+//The pair of integers divider and Counter_Steps, which implies the carrier frequency closest to 6kHz corresponds to:
+// divider=67 and Counter_Steps=199 (or vice versa), resulting in the frequency of 6000.15 kHz. 
+//Remember that since zero is a counter state, Counter_Steps corresponds to TOP+1.
 
-hw_timer_t * timer = NULL;
 int32_t sample_v, sample_i; //samples of voltage and current read from ADC1
 int32_t sum_vd;             //digital voltage summation 
 int32_t sum_vd2;            //squared digital voltage summation 
@@ -56,20 +61,17 @@ struct summation_samples
     };
 struct summation_samples S; //struture to send samples from ISR
 
-float gain_v,offset_v;     // voltage gain and offset obtained by multipoint calibration in fixed point 
-float gain_i,offset_i;     // current gain and offset obtained by multipoint calibration in fixed point 
+float gain_v,offset_v;     // voltage gain and offset obtained by multipoint calibration 
+float gain_i,offset_i;     // current gain and offset obtained by multipoint calibration 
 float Vrms, Irms;          // rms values
-struct RMS_quantities
-    {
-      float Vrms;
-      float Irms;
-    };
-struct RMS_quantities R;     //structure to receive RMS values from RMS_Calc Task
-int intCounter;              // timer interrupt counter 
-volatile int print_LCD;      // variable to control LCD print frequency                   
+float Bv2,Bv1,Bv0;          // coefficients to calculate the average value of V2 in Volt
+float Bi2,Bi1,Bi0;          // coefficients to calculate the average value of I2 in Ampére
+float average_v2,average_i2; // mean squared values
+
+
+volatile int intCounter;     // timer interrupt counter 
 
 QueueHandle_t queue_samples; // Queue to transfer data from ISR to RMS_Calc Task
-QueueHandle_t queue_RMS_Value;//Queue to transfer data from RMS_Calc Task to Loop
 
 // ----- wireless variables ----------------------------------  
 const char* WL_SSID = "Esp32_Multimeter";
@@ -88,11 +90,11 @@ LiquidCrystal_I2C lcd2(0x26,20,4);  //Right side -> PCF8574 only A0 jumper short
 //**************************************************************************************************************
 // Interrupt Service Routine - ISR
 //**************************************************************************************************************
-void IRAM_ATTR onTimer()  
+void IRAM_ATTR onTimer(void *args)  
 { 
  sample_v = adc1_get_raw(ADC1_CHANNEL_4);  //GPIO32  -> voltage channel reading
  sample_i = adc1_get_raw(ADC1_CHANNEL_5);  //GPIO33  -> current channel reading 
-
+ 
  //---------- update the summations of samples v, i, and squared sample v2 and i2 --------------
  // --> remove first sample of FIFO (tail) from summation
  sum_vd  = sum_vd  - buffer_vd[buf_index]; 
@@ -117,17 +119,17 @@ void IRAM_ATTR onTimer()
  if(buf_index >= 100) buf_index = 0;     //reset pointer if it reaches the end (circular buffer)
 
  intCounter++;
- if (intCounter>=3000)   // update measurements for the consumer at 2Hz
-   {                     // As FreeRTOS tick frequency is 100Hz, it is not possible to send/store calculated samples at 6kHz
-     intCounter=0;       // As the idea here is to show the rms values to the user, the data will be updated at each second 
-     S.sum_vd=sum_vd;    // do not use a faster update, since the task that consume data can not follow the producer
-     S.sum_id=sum_id; 
+ if (intCounter>=6000)   // update measurements for the consumer at 1Hz
+   {                     // Although the xQueueSendFromISR and xQueueReceive functions are not speed-limited by the FreeRTOS tick rate, 
+     intCounter=0;       //     the goal here is to display RMS data on an LCD and webpage, so a high rate is not appropriate. 
+     S.sum_vd=sum_vd;    // For faster applications, such as storing curves as vectors in memory, it's important to verify that
+     S.sum_id=sum_id;    //     the task consuming the data can keep up with the one producing it.
      S.sum_vd2=sum_vd2;    
      S.sum_id2=sum_id2;
-     xQueueSendFromISR(queue_samples, &S, NULL );// send summations to task
-     print_LCD=1;        //used to sinc LCD print at each 1/2 second
-                         //note that this implies a data tranfer between tasks using global variable, but in low frequency
+     xQueueSendFromISR(queue_samples, &S, NULL );// send summations to task                       
    }  
+  timer_group_clr_intr_status_in_isr(TIMER_GROUP, TIMER_INDEX); //clear the interrupt flag for the timer 0 in Group 0 
+  timer_group_enable_alarm_in_isr(TIMER_GROUP, TIMER_INDEX);    // enable alarm of the timer 0 in Group 0 for the next cycle
 }
 //**************************************************************************************************************
 //  SETUP
@@ -144,12 +146,9 @@ void setup() {
  //      and keep the USB connection simultaneously.
  
 //-------config ADC  ------------------------
-  adcAttachPin(ADC1_CHANNEL_4);
-  adcAttachPin(ADC1_CHANNEL_5);
-  analogSetClockDiv(1);
-  adc1_config_width(ADC_WIDTH_BIT_12);
-  adc1_config_channel_atten(ADC1_CHANNEL_4,ADC_ATTEN_DB_11);
-  adc1_config_channel_atten(ADC1_CHANNEL_5,ADC_ATTEN_DB_11);
+ adc1_config_width(ADC_WIDTH_BIT_12);
+ adc1_config_channel_atten(ADC1_CHANNEL_4,ADC_ATTEN_DB_11);
+ adc1_config_channel_atten(ADC1_CHANNEL_5,ADC_ATTEN_DB_11);
 
  lcd1.begin();     //start LCD1
  lcd2.begin();     //start LCD2
@@ -175,7 +174,6 @@ void setup() {
 
  //--------- Initializations ------------- 
   intCounter=0;
-  print_LCD=0;
   sum_vd=0;
   sum_id=0; 
   sum_vd2=0;
@@ -193,27 +191,25 @@ void setup() {
      }
   buf_index=0;
  //-> coefficients to convert samples to Volt and Ampére obtained by multipoint calibration 
- //-> Dados de calibração Jun/2023 - LV20_Rp=27k  LA55-> 4 espiras
+ //-> Calibration data Jun/2023 - LV20_Rp=27k  LA55-> 4-turn
    gain_v = 0.279;
  offset_v = -523.69;
    gain_i = -0.0065728;
  offset_i = 12.338;
+
+   //determine the coefficients for RMS value calculation
+   Bv2=gain_v*gain_v*0.01;
+   Bv1=2*gain_v*offset_v*0.01;
+   Bv0=offset_v*offset_v;
+   Bi2=gain_i*gain_i*0.01;
+   Bi1=2*gain_i*offset_i*0.01;
+   Bi0=offset_i*offset_i;
  
  // Create queues to transfer data 
- queue_samples = xQueueCreate( 1, sizeof(struct summation_samples )); // create queue -> 1 position of struct summation_samples
- queue_RMS_Value = xQueueCreate( 1, sizeof(struct RMS_quantities )); // create queue -> 1 position of struct summation_samples
- 
- // --------- config timer and interrupt service routine ---------------------
-  timer = timerBegin(0, 4, true);    //For cpu_clk=80Mhz -> timer_clk=20MHz
-  timerAttachInterrupt(timer, &onTimer, true);
-  timerAlarmWrite(timer, 3333, true);    //-> clk=20Mhz/3333 -> interrupt rate = 6000.6Hz  
-  //the "timerAlarmEnable(timer)" will be executed after the RMS_Calc task starts
- 
- //Create a task to calculate the RMS Values in core 0  
-  xTaskCreatePinnedToCore(RMS_Calc, "RMS_Calc", 8192, NULL, 1, NULL, 0);
-
+  queue_samples = xQueueCreate( 1, sizeof(struct summation_samples )); // create queue -> 1 position of struct summation_samples
+  
   Serial.println(" Creating the access point");
-  esp32_AP = WiFi.softAP(WL_SSID, WL_pass, 2, 0, 4);//channel 2, broadcast SSID, 4 Max simultaneous connected clients
+  esp32_AP = WiFi.softAP(WL_SSID, WL_pass);//default: channel 1, 4 Max simultaneous connected clients
   if(esp32_AP)
      {
       Serial.println(" WiFi AP is online!");
@@ -254,9 +250,13 @@ void setup() {
   server.on("/",      RMS_data); 
   server.begin();                         // Starting the webserver
   Serial.println("Webserver started..."); // Start the webserver 
-  
-  vTaskDelay(pdMS_TO_TICKS(5000)); //wait 5s;
-  timerAlarmEnable(timer);  // start interrupt operation, task is running and able to receive data
+   
+  // --------- config timer and interrupt service routine ---------------------
+  Config_Timer();
+  Serial.println("Timer was configured...");
+  Serial.println("ISR was installed...");
+  vTaskDelay(pdMS_TO_TICKS(5000)); //wait 5s
+  timer_enable_intr(TIMER_GROUP, TIMER_INDEX);
 }
 //**************************************************************************************************************
 //  LOOP
@@ -264,67 +264,69 @@ void setup() {
 void loop()
  {
   char quantity1[5], quantity2[7];
-  if(xQueueReceive(queue_RMS_Value, &R, portMAX_DELAY)== pdPASS )
-      {
-       Vrms=R.Vrms;
-       Irms=R.Irms; 
-      }
-      
-   if(print_LCD==1) //update RMS Values in the LCD at each 1/2 second
-      {
-       print_LCD=0; 
-       dtostrf(Vrms, 5, 1,quantity1);
-       sprintf(quantity2,"%5sV", quantity1); 
-       lcd1.setCursor(26,0);  // set cursor postion to row 3, column 7  
-               // 01234567890123456789
-               //"Vrms: 220.1V ");
-       lcd1.print(quantity2); //print Vrms on LCD1
+  struct summation_samples R; //struture to receive samples from ISR
 
-       dtostrf(Irms, 5, 1,quantity1);
-       sprintf(quantity2,"%5sA", quantity1);
-       lcd1.setCursor(26,1);  //set cursor postion to row 4, column 7  
-             // 01234567890123456789
-             //"Irms:  10.1A ");
-       lcd1.print(quantity2); //print Irms on LCD1
-      }      
+  if(xQueueReceive(queue_samples, &R, pdMS_TO_TICKS(100)) == pdPASS ) //wait for new squared average value (100ms)
+     {
+      digitalWrite(Run_LED_Control, !digitalRead(Run_LED_Control)); //blink LED in 0.5Hz ==> RMS_Calc is running!  
+      //--- rms calculations => here floating-point calculations are possible ------
+      average_v2= Bv2*(float)R.sum_vd2 + Bv1*(float)R.sum_vd + Bv0; //calculate the average value of V2 in Volt
+      Vrms=sqrt(average_v2);
+      average_i2= Bi2*(float)R.sum_id2 + Bi1*(float)R.sum_id + Bi0; //calculate the average value of I2 in Ampére
+      Irms=sqrt(average_i2);
+ 
+      dtostrf(Vrms, 5, 1,quantity1);
+      sprintf(quantity2,"%5sV", quantity1); 
+      lcd1.setCursor(26,0);  // set cursor postion to row 3, column 7  
+              // 01234567890123456789
+              //"Vrms: 220.1V ");
+      lcd1.print(quantity2); //print Vrms on LCD1
+
+      dtostrf(Irms, 5, 1,quantity1);
+      sprintf(quantity2,"%5sA", quantity1);
+      lcd1.setCursor(26,1);  //set cursor postion to row 4, column 7  
+            // 01234567890123456789
+            //"Irms:  10.1A ");
+      lcd1.print(quantity2); //print Irms on LCD1
+     }   
+
    server.handleClient();
-   vTaskDelay(pdMS_TO_TICKS(200)); //wait 200ms
  }
 
 //**************************************************************************************************************
-//  Task to calculate RMS Values
+// Timer configuration function
+// The functions below allows the specification of divider and counter top. This can allow the user to get the
+// desired frequency for the sample rate. Same Arduino functions has the frequency as the parameter, which is easier
+// to use, but this may result in a frequency which is not the best approximation to the desired frequency
 //**************************************************************************************************************
-void RMS_Calc(void*z)
- {
-   char quantity1[5], quantity2[7];
-   struct summation_samples R; //structure to receive data
-   struct RMS_quantities S;    //structure to send data to webserver
-   float Bv2,Bv1,Bv0;          // coefficients to calculate the average value of V2 in Volt
-   float Bi2,Bi1,Bi0;          // coefficients to calculate the average value of I2 in Ampére
-   float average_v2,average_i2; // mean squared values
-   // calculate the ccoefficients
-   Bv2=gain_v*gain_v*0.01;
-   Bv1=2*gain_v*offset_v*0.01;
-   Bv0=offset_v*offset_v;
-   Bi2=gain_i*gain_i*0.01;
-   Bi1=2*gain_i*offset_i*0.01;
-   Bi0=offset_i*offset_i;
-   Serial.println("RMS_Calc() is running in core: " + String(xPortGetCoreID()));
-   for(;;)
-      {
-       if(xQueueReceive(queue_samples, &R, portMAX_DELAY)== pdPASS ) 
-          {
-           digitalWrite(Run_LED_Control, !digitalRead(Run_LED_Control)); //blink LED in 1Hz ==> RMS_Calc is running!  
-           //--- rms calculations => here floating-point calculations are possible ------
-           average_v2= Bv2*(float)R.sum_vd2 + Bv1*(float)R.sum_vd + Bv0; //calculate the average value of V2 in Volt
-           S.Vrms=sqrt(average_v2);
-           average_i2= Bi2*(float)R.sum_id2 + Bi1*(float)R.sum_id + Bi0; //calculate the average value of I2 in Ampére
-           S.Irms=sqrt(average_i2);
-           xQueueSend(queue_RMS_Value, &S, NULL );// send RMS values to Loop
-          }              
-     vTaskDelay(pdMS_TO_TICKS(100)); //wait 100ms
-     }    
- }
+void Config_Timer(void) {
+    timer_config_t config = {       
+        .alarm_en = TIMER_ALARM_EN,    // Enable the alarm
+        .counter_en = TIMER_PAUSE,     // Start the timer in paused state
+        .intr_type = TIMER_INTR_LEVEL, // Set interrupt type to edge-triggered
+        .counter_dir = TIMER_COUNT_UP, // Count up mode
+        .auto_reload = TIMER_AUTORELOAD_EN, // Enable auto-reload
+        .divider = TIMER_DIVIDER,     // Timer divider for frequency control
+    };
+
+    // Initialize the timer
+    timer_init(TIMER_GROUP, TIMER_INDEX, &config);        
+    
+    // Set the initial counter value
+    timer_set_counter_value(TIMER_GROUP, TIMER_INDEX, 0);  
+    
+    // Set the alarm value for the timer (defines the timer frequency)
+    timer_set_alarm_value(TIMER_GROUP, TIMER_INDEX, TIMER_TOP_COUNT);  
+
+    // Register the ISR (Interrupt Service Routine)
+    timer_isr_register(TIMER_GROUP, TIMER_INDEX, onTimer, nullptr, ESP_INTR_FLAG_IRAM, nullptr);
+
+    // Enable the timer interrupt
+    //timer_enable_intr(TIMER_GROUP, TIMER_INDEX); //it will be enabled at the end of setup
+
+    // Start the timer
+    timer_start(TIMER_GROUP, TIMER_INDEX);   
+}
 
 //**************************************************************************************************************
 // |=======================================================================================================|
